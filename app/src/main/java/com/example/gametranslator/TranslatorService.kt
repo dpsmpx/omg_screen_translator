@@ -1,10 +1,12 @@
 package com.example.gametranslator
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.content.res.Configuration
@@ -16,6 +18,7 @@ import android.graphics.drawable.GradientDrawable
 import android.graphics.drawable.Icon
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.hardware.input.InputManager
 import android.media.Image
 import android.media.ImageReader
 import android.media.projection.MediaProjection
@@ -26,6 +29,7 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
+import android.view.Display
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.View
@@ -35,6 +39,9 @@ import android.widget.TextView
 import android.widget.Toast
 import com.google.android.gms.tasks.Tasks
 import com.google.mlkit.common.model.DownloadConditions
+import com.google.mlkit.common.model.RemoteModelManager
+import com.google.mlkit.nl.translate.TranslateLanguage
+import com.google.mlkit.nl.translate.TranslateRemoteModel
 import com.google.mlkit.nl.translate.Translation
 import com.google.mlkit.nl.translate.Translator
 import com.google.mlkit.nl.translate.TranslatorOptions
@@ -44,8 +51,11 @@ import com.google.mlkit.vision.text.TextRecognizer
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
 import com.google.mlkit.vision.text.japanese.JapaneseTextRecognizerOptions
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import java.nio.ByteBuffer
 import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.math.abs
 
 /**
  * Служба: показывает плавающую панель, а по нажатию «Перевод»
@@ -66,25 +76,29 @@ class TranslatorService : Service() {
     private val worker = Executors.newSingleThreadExecutor()
     private val busy = AtomicBoolean(false)
 
-    private lateinit var wm: WindowManager
-    private var wmReady = false
+    // Окна поверх игры (меняются только из главного потока)
+    private var overlayContext: Context? = null
+    @Volatile
+    private var wm: WindowManager? = null
     private var resultView: OverlayResultView? = null
     private var barView: LinearLayout? = null
     private var langButton: TextView? = null
+    @Volatile
     private var useRoot = false
 
-    // Захват экрана через MediaProjection (обычный режим)
+    // Захват экрана через MediaProjection (обычный режим). Всё защищено captureLock.
+    private val captureLock = Any()
     private var projection: MediaProjection? = null
+    private var projectionCallback: MediaProjection.Callback? = null
     private var virtualDisplay: VirtualDisplay? = null
     private var imageReader: ImageReader? = null
     private var captureThread: HandlerThread? = null
     private var captureHandler: Handler? = null
-    private val frameLock = Any()
     private var latestImage: Image? = null
     private var capW = 0
     private var capH = 0
 
-    // ML Kit: распознавание и перевод
+    // ML Kit: распознавание и перевод (используются только в потоке worker)
     private val recognizers = HashMap<String, TextRecognizer>()
     private var translator: Translator? = null
     private var translatorKey = ""
@@ -96,25 +110,30 @@ class TranslatorService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        useRoot = intent?.getBooleanExtra(EXTRA_ROOT, false) ?: false
+        val root = intent?.getBooleanExtra(EXTRA_ROOT, false) ?: false
 
+        // startForeground нужно вызвать сразу (и обязательно до получения MediaProjection)
         try {
-            startAsForeground()
+            startAsForeground(root)
         } catch (e: Exception) {
-            toast("Не удалось запустить службу: " + (e.message ?: e.javaClass.simpleName))
+            toast("Не удалось запустить службу: " + describe(e))
             stopSelf()
             return START_NOT_STICKY
         }
+
+        // Повторный запуск уже работающей службы: убираем старую панель и старую запись экрана,
+        // иначе панели и виртуальные экраны будут множиться.
+        removeOverlays()
+        stopCapture()
+        useRoot = root
 
         if (!Settings.canDrawOverlays(this)) {
             toast("Нет разрешения «Поверх других окон»")
             stopSelf()
             return START_NOT_STICKY
         }
-        wm = getSystemService(WindowManager::class.java)
-        wmReady = true
 
-        if (!useRoot) {
+        if (!root) {
             val resultCode = intent?.getIntExtra(EXTRA_RESULT_CODE, 0) ?: 0
             val data = readProjectionData(intent)
             if (data == null) {
@@ -125,29 +144,38 @@ class TranslatorService : Service() {
             try {
                 startProjection(resultCode, data)
             } catch (e: Exception) {
-                toast("Не удалось начать запись экрана: " + (e.message ?: e.javaClass.simpleName))
+                toast("Не удалось начать запись экрана: " + describe(e))
                 stopSelf()
                 return START_NOT_STICKY
             }
         }
 
-        createOverlays()
+        try {
+            createOverlays()
+        } catch (e: Exception) {
+            toast("Не удалось показать плавающую панель: " + describe(e))
+            stopSelf()
+            return START_NOT_STICKY
+        }
         return START_NOT_STICKY
     }
 
     @Suppress("DEPRECATION")
     private fun readProjectionData(intent: Intent?): Intent? {
         if (intent == null) return null
-        return if (Build.VERSION.SDK_INT >= 33) {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             intent.getParcelableExtra(EXTRA_DATA, Intent::class.java)
         } else {
             intent.getParcelableExtra(EXTRA_DATA)
         }
     }
 
+    private fun describe(e: Throwable): String = e.message ?: e.javaClass.simpleName
+
     // ---------------------------------------------------------------- уведомление
 
-    private fun startAsForeground() {
+    @Suppress("DEPRECATION")
+    private fun startAsForeground(root: Boolean) {
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(
             NotificationChannel(CHANNEL_ID, "Экранный переводчик", NotificationManager.IMPORTANCE_LOW)
@@ -159,6 +187,12 @@ class TranslatorService : Service() {
             stopIntent,
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
         )
+        val openPending = PendingIntent.getActivity(
+            this,
+            1,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
         val stopAction = Notification.Action.Builder(
             Icon.createWithResource(this, android.R.drawable.ic_menu_close_clear_cancel),
             "Остановить",
@@ -168,28 +202,66 @@ class TranslatorService : Service() {
             .setSmallIcon(android.R.drawable.ic_menu_search)
             .setContentTitle("Экранный переводчик работает")
             .setContentText("Откройте игру и нажимайте «Перевод» на плавающей панели")
+            .setContentIntent(openPending)
             .addAction(stopAction)
             .setOngoing(true)
             .build()
-        val type = if (useRoot) {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
-        } else {
-            ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+        val type = when {
+            !root -> ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+            // тип «specialUse» появился только в Android 14
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ->
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+            else -> ServiceInfo.FOREGROUND_SERVICE_TYPE_NONE
         }
         startForeground(NOTIFICATION_ID, notification, type)
     }
 
     // ---------------------------------------------------------------- плавающая панель
 
+    /**
+     * WindowManager для окон поверх других приложений. У обычного контекста службы нет
+     * «своего» экрана: размеры экрана из него могут быть неверными, а на Android 11
+     * обращение к экрану из такого контекста может закончиться исключением.
+     * Поэтому создаём специальный оконный контекст.
+     */
+    private fun ensureWindowManager(): WindowManager {
+        wm?.let { return it }
+        val context: Context = try {
+            val display = getSystemService(DisplayManager::class.java).getDisplay(Display.DEFAULT_DISPLAY)
+            createDisplayContext(display)
+                .createWindowContext(WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, null)
+        } catch (e: Exception) {
+            this
+        }
+        val manager = context.getSystemService(WindowManager::class.java)
+        overlayContext = context
+        wm = manager
+        return manager
+    }
+
+    /**
+     * Android 12+ пропускает касания сквозь окно другого приложения, только если это окно
+     * достаточно прозрачное (по умолчанию не плотнее 0.8). Без этого игра переставала бы
+     * реагировать на нажатия, пока на экране показан перевод.
+     */
+    private fun passThroughAlpha(): Float {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.S) return 1f
+        val max = getSystemService(InputManager::class.java).maximumObscuringOpacityForTouch
+        return if (max >= 0.5f) minOf(max, 1f) else 0.8f
+    }
+
     private fun languageLabel(): String {
         return Langs.source(Prefs.source(this)).label + "→" + Langs.target(Prefs.target(this)).label
     }
 
+    @SuppressLint("ClickableViewAccessibility")
     private fun createOverlays() {
-        val density = resources.displayMetrics.density
+        val manager = ensureWindowManager()
+        val context = overlayContext ?: this
+        val density = context.resources.displayMetrics.density
 
         // Прозрачный слой для перевода: пропускает все касания к игре
-        val result = OverlayResultView(this)
+        val result = OverlayResultView(context)
         val resultParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -202,11 +274,13 @@ class TranslatorService : Service() {
         )
         resultParams.layoutInDisplayCutoutMode =
             WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
-        wm.addView(result, resultParams)
+        resultParams.fitInsetsTypes = 0 // на весь экран, без отступов под системные панели
+        resultParams.alpha = passThroughAlpha()
+        manager.addView(result, resultParams)
         resultView = result
 
         fun makeButton(caption: String): TextView {
-            val view = TextView(this)
+            val view = TextView(context)
             view.text = caption
             view.setTextColor(Color.WHITE)
             view.textSize = 14f
@@ -223,7 +297,7 @@ class TranslatorService : Service() {
         val hide = makeButton("Скрыть")
         langButton = lang
 
-        val bar = LinearLayout(this)
+        val bar = LinearLayout(context)
         bar.orientation = LinearLayout.HORIZONTAL
         val background = GradientDrawable()
         background.setColor(Color.argb(215, 25, 25, 25))
@@ -251,6 +325,7 @@ class TranslatorService : Service() {
         lang.setOnClickListener { cycleSourceLanguage() }
 
         // Панель можно двигать за значок «≡»
+        val touchSlop = 8 * density
         handle.setOnTouchListener(object : View.OnTouchListener {
             private var startX = 0
             private var startY = 0
@@ -258,7 +333,7 @@ class TranslatorService : Service() {
             private var downY = 0f
 
             override fun onTouch(v: View, event: MotionEvent): Boolean {
-                when (event.action) {
+                when (event.actionMasked) {
                     MotionEvent.ACTION_DOWN -> {
                         startX = barParams.x
                         startY = barParams.y
@@ -268,15 +343,47 @@ class TranslatorService : Service() {
                     MotionEvent.ACTION_MOVE -> {
                         barParams.x = startX + (event.rawX - downX).toInt()
                         barParams.y = startY + (event.rawY - downY).toInt()
-                        wm.updateViewLayout(bar, barParams)
+                        try {
+                            manager.updateViewLayout(bar, barParams)
+                        } catch (e: IllegalArgumentException) {
+                            // панель уже убрана с экрана
+                        }
+                    }
+                    MotionEvent.ACTION_UP -> {
+                        if (abs(event.rawX - downX) < touchSlop && abs(event.rawY - downY) < touchSlop) {
+                            v.performClick()
+                        }
                     }
                 }
                 return true
             }
         })
 
-        wm.addView(bar, barParams)
+        manager.addView(bar, barParams)
         barView = bar
+    }
+
+    private fun removeOverlays() {
+        val manager = wm
+        if (manager != null) {
+            resultView?.let { view ->
+                try {
+                    manager.removeView(view)
+                } catch (e: Exception) {
+                    // уже убрано
+                }
+            }
+            barView?.let { view ->
+                try {
+                    manager.removeView(view)
+                } catch (e: Exception) {
+                    // уже убрано
+                }
+            }
+        }
+        resultView = null
+        barView = null
+        langButton = null
     }
 
     private fun cycleSourceLanguage() {
@@ -293,26 +400,32 @@ class TranslatorService : Service() {
         if (!busy.compareAndSet(false, true)) return
 
         // Прячем панель и старый перевод, чтобы они не попали на снимок
-        main.post {
-            resultView?.clear()
-            barView?.visibility = View.INVISIBLE
-        }
+        resultView?.clear()
+        barView?.visibility = View.INVISIBLE
 
-        worker.execute {
-            try {
-                Thread.sleep(350)
-                val bitmap = if (useRoot) captureRoot() else captureProjectionBitmap()
-                if (bitmap == null) {
-                    showMessage("Не удалось сделать снимок экрана. Нажмите «Перевод» ещё раз.")
-                } else {
-                    recognizeAndTranslate(bitmap)
+        try {
+            worker.execute {
+                try {
+                    Thread.sleep(350)
+                    val bitmap = if (useRoot) captureRoot() else captureProjectionBitmap()
+                    if (bitmap == null) {
+                        showMessage("Не удалось сделать снимок экрана. Нажмите «Перевод» ещё раз.")
+                    } else {
+                        recognizeAndTranslate(bitmap)
+                    }
+                } catch (e: InterruptedException) {
+                    // служба останавливается
+                } catch (e: Exception) {
+                    showMessage("Ошибка: " + describe(e))
+                } finally {
+                    main.post { barView?.visibility = View.VISIBLE }
+                    busy.set(false)
                 }
-            } catch (e: Exception) {
-                showMessage("Ошибка: " + (e.message ?: e.javaClass.simpleName))
-            } finally {
-                main.post { barView?.visibility = View.VISIBLE }
-                busy.set(false)
             }
+        } catch (e: RejectedExecutionException) {
+            // служба уже останавливается
+            barView?.visibility = View.VISIBLE
+            busy.set(false)
         }
     }
 
@@ -321,16 +434,22 @@ class TranslatorService : Service() {
     }
 
     private fun toast(text: String) {
-        main.post { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            Toast.makeText(this, text, Toast.LENGTH_LONG).show()
+        } else {
+            main.post { Toast.makeText(this, text, Toast.LENGTH_LONG).show() }
+        }
     }
 
     // ---------------------------------------------------------------- снимок экрана
 
     /** Root-режим: снимок через команду su screencap. */
     private fun captureRoot(): Bitmap? {
-        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "screencap -p"))
+        // stderr отбрасываем: если его не читать, переполненный буфер может «подвесить» процесс
+        val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "screencap -p 2>/dev/null"))
         return try {
-            val bytes = process.inputStream.readBytes()
+            process.outputStream.close()
+            val bytes = process.inputStream.use { it.readBytes() }
             process.waitFor()
             if (bytes.isEmpty()) null else BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
         } finally {
@@ -340,106 +459,113 @@ class TranslatorService : Service() {
 
     /** Обычный режим: берём последний кадр записи экрана. */
     private fun captureProjectionBitmap(): Bitmap? {
-        val bounds = wm.maximumWindowMetrics.bounds
-        var rebuilt = false
-        if (bounds.width() != capW || bounds.height() != capH) {
-            // экран повернули — пересоздаём приёмник кадров под новый размер
-            rebuildReader(bounds.width(), bounds.height())
-            rebuilt = true
+        val bounds = (wm ?: return null).maximumWindowMetrics.bounds
+        val resized = synchronized(captureLock) {
+            if (projection == null) return null
+            if (bounds.width() != capW || bounds.height() != capH) {
+                // экран повернули — меняем размер приёмника кадров
+                rebuildReaderLocked(bounds.width(), bounds.height())
+                true
+            } else {
+                false
+            }
         }
-        if (rebuilt) Thread.sleep(500)
+        if (resized) Thread.sleep(500)
 
         // ждём, пока придёт хотя бы один кадр (не дольше 2 секунд)
         var waited = 0
         while (waited < 2000) {
-            val hasFrame = synchronized(frameLock) { latestImage != null }
+            val hasFrame = synchronized(captureLock) { latestImage != null }
             if (hasFrame) break
             Thread.sleep(50)
             waited += 50
         }
 
-        return synchronized(frameLock) {
-            val image = latestImage
-            if (image == null) null else imageToBitmap(image)
+        return synchronized(captureLock) {
+            latestImage?.let { imageToBitmap(it) }
         }
     }
 
+    /** Переводит кадр записи экрана в Bitmap (с учётом выравнивания строк, см. FramePacker). */
     private fun imageToBitmap(image: Image): Bitmap {
+        val width = image.width
+        val height = image.height
         val plane = image.planes[0]
         val pixelStride = plane.pixelStride
         val rowStride = plane.rowStride
-        val rowPadding = rowStride - pixelStride * image.width
-        val buffer = plane.buffer
-        buffer.rewind()
-        val wide = Bitmap.createBitmap(
-            image.width + rowPadding / pixelStride,
-            image.height,
-            Bitmap.Config.ARGB_8888
-        )
-        wide.copyPixelsFromBuffer(buffer)
-        if (rowPadding == 0) return wide
-        val cropped = Bitmap.createBitmap(wide, 0, 0, image.width, image.height)
-        wide.recycle()
-        return cropped
+        val src: ByteBuffer = plane.buffer.duplicate()
+        src.rewind()
+
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val rowBytes = width * 4
+        if (pixelStride == 4 && rowStride == rowBytes && src.remaining() >= rowBytes * height) {
+            bitmap.copyPixelsFromBuffer(src)
+        } else {
+            bitmap.copyPixelsFromBuffer(FramePacker.pack(src, width, height, pixelStride, rowStride))
+        }
+        return bitmap
     }
 
     private fun startProjection(resultCode: Int, data: Intent) {
         val manager = getSystemService(MediaProjectionManager::class.java)
         val p = manager.getMediaProjection(resultCode, data)
-        p.registerCallback(object : MediaProjection.Callback() {
+            ?: throw IllegalStateException("система не выдала доступ к записи экрана")
+        val callback = object : MediaProjection.Callback() {
             override fun onStop() {
-                main.post { stopSelf() }
+                // запись экрана остановлена (пользователем, системой или при блокировке экрана)
+                val current = synchronized(captureLock) { projection === p }
+                if (current) stopSelf()
             }
-        }, main)
-        projection = p
+        }
+        // Android 14+: колбэк обязательно регистрировать до createVirtualDisplay
+        p.registerCallback(callback, main)
 
         val thread = HandlerThread("capture")
         thread.start()
-        captureThread = thread
-        captureHandler = Handler(thread.looper)
-
-        val bounds = wm.maximumWindowMetrics.bounds
-        rebuildReader(bounds.width(), bounds.height())
+        val bounds = ensureWindowManager().maximumWindowMetrics.bounds
+        synchronized(captureLock) {
+            projection = p
+            projectionCallback = callback
+            captureThread = thread
+            captureHandler = Handler(thread.looper)
+            rebuildReaderLocked(bounds.width(), bounds.height())
+        }
     }
 
-    /** Создаёт (или пересоздаёт при повороте экрана) приёмник кадров записи экрана. */
-    private fun rebuildReader(w: Int, h: Int) {
-        synchronized(frameLock) {
-            latestImage?.close()
-            latestImage = null
-        }
+    /** Создаёт (или пересоздаёт при повороте экрана) приёмник кадров. Вызывать под captureLock. */
+    private fun rebuildReaderLocked(w: Int, h: Int) {
+        val p = projection ?: return
+        latestImage?.close()
+        latestImage = null
+
         val old = imageReader
         val reader = ImageReader.newInstance(w, h, PixelFormat.RGBA_8888, 3)
-        reader.setOnImageAvailableListener({ r ->
-            try {
-                val image = r.acquireLatestImage()
-                if (image != null) {
-                    synchronized(frameLock) {
-                        latestImage?.close()
-                        latestImage = image
-                    }
-                }
-            } catch (e: Exception) {
-                // приёмник могли закрыть во время смены размера — это нормально
-            }
-        }, captureHandler)
+        reader.setOnImageAvailableListener({ r -> onFrameAvailable(r) }, captureHandler)
 
         val dpi = resources.displayMetrics.densityDpi
-        val display = virtualDisplay
-        if (display == null) {
-            virtualDisplay = projection!!.createVirtualDisplay(
-                "screen-translator",
-                w,
-                h,
-                dpi,
-                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
-                reader.surface,
-                null,
-                null
-            )
-        } else {
-            display.surface = reader.surface
-            display.resize(w, h, dpi)
+        try {
+            val display = virtualDisplay
+            if (display == null) {
+                // Android 14+: у одного MediaProjection можно создать только один виртуальный
+                // экран, поэтому при повороте дальше только меняем его размер.
+                virtualDisplay = p.createVirtualDisplay(
+                    "screen-translator",
+                    w,
+                    h,
+                    dpi,
+                    DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                    reader.surface,
+                    null,
+                    null
+                ) ?: throw IllegalStateException("не удалось создать виртуальный экран")
+            } else {
+                display.surface = reader.surface
+                display.resize(w, h, dpi)
+            }
+        } catch (e: Exception) {
+            reader.setOnImageAvailableListener(null, null)
+            reader.close()
+            throw e
         }
         imageReader = reader
         capW = w
@@ -449,12 +575,59 @@ class TranslatorService : Service() {
         old?.close()
     }
 
+    /** Новый кадр записи экрана: храним только самый свежий. */
+    private fun onFrameAvailable(reader: ImageReader) {
+        synchronized(captureLock) {
+            if (reader !== imageReader) return
+            try {
+                val image = reader.acquireLatestImage() ?: return
+                latestImage?.close()
+                latestImage = image
+            } catch (e: Exception) {
+                // приёмник могли закрыть во время смены размера — это нормально
+            }
+        }
+    }
+
+    /** Останавливает запись экрана и освобождает всё, что с ней связано. */
+    private fun stopCapture() {
+        val old: Pair<MediaProjection, MediaProjection.Callback?>? = synchronized(captureLock) {
+            latestImage?.close()
+            latestImage = null
+            virtualDisplay?.release()
+            virtualDisplay = null
+            imageReader?.setOnImageAvailableListener(null, null)
+            imageReader?.close()
+            imageReader = null
+            captureThread?.quitSafely()
+            captureThread = null
+            captureHandler = null
+            capW = 0
+            capH = 0
+            val p = projection
+            val cb = projectionCallback
+            projection = null
+            projectionCallback = null
+            if (p == null) null else Pair(p, cb)
+        }
+        if (old != null) {
+            val (p, cb) = old
+            try {
+                // сначала отписываемся, чтобы остановка не закрыла саму службу
+                if (cb != null) p.unregisterCallback(cb)
+                p.stop()
+            } catch (e: Exception) {
+                // запись уже остановлена
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- распознавание и перевод
 
     private fun recognizerFor(lang: String): TextRecognizer {
         val key = when (lang) {
-            "ja" -> "ja"
-            "zh" -> "zh"
+            TranslateLanguage.JAPANESE -> "ja"
+            TranslateLanguage.CHINESE -> "zh"
             else -> "latin"
         }
         return recognizers.getOrPut(key) {
@@ -468,17 +641,30 @@ class TranslatorService : Service() {
 
     private fun translatorFor(src: String, tgt: String): Translator {
         val key = "$src>$tgt"
-        if (key != translatorKey) {
-            translator?.close()
-            translator = Translation.getClient(
-                TranslatorOptions.Builder()
-                    .setSourceLanguage(src)
-                    .setTargetLanguage(tgt)
-                    .build()
-            )
-            translatorKey = key
+        val current = translator
+        if (current != null && key == translatorKey) return current
+        current?.close()
+        val created = Translation.getClient(
+            TranslatorOptions.Builder()
+                .setSourceLanguage(src)
+                .setTargetLanguage(tgt)
+                .build()
+        )
+        translator = created
+        translatorKey = key
+        return created
+    }
+
+    /** Скачаны ли модели перевода (английская для ML Kit — «опорная», её не проверяем). */
+    private fun modelsDownloaded(vararg codes: String): Boolean {
+        return try {
+            val manager = RemoteModelManager.getInstance()
+            codes.filter { it != TranslateLanguage.ENGLISH }.all { code ->
+                Tasks.await(manager.isModelDownloaded(TranslateRemoteModel.Builder(code).build()))
+            }
+        } catch (e: Exception) {
+            false
         }
-        return translator!!
     }
 
     private fun recognizeAndTranslate(bitmap: Bitmap) {
@@ -487,11 +673,14 @@ class TranslatorService : Service() {
         val bitmapW = bitmap.width
         val bitmapH = bitmap.height
 
-        val recognized = Tasks.await(recognizerFor(src).process(InputImage.fromBitmap(bitmap, 0)))
-        bitmap.recycle()
+        val recognized = try {
+            Tasks.await(recognizerFor(src).process(InputImage.fromBitmap(bitmap, 0)))
+        } finally {
+            bitmap.recycle()
+        }
 
         // у китайского и японского нет пробелов между словами
-        val noSpaces = src == "zh" || src == "ja"
+        val noSpaces = src == TranslateLanguage.CHINESE || src == TranslateLanguage.JAPANESE
         val blocks = recognized.textBlocks.filter { block ->
             block.boundingBox != null && block.text.any { ch -> ch.isLetter() }
         }
@@ -507,8 +696,13 @@ class TranslatorService : Service() {
             }
         } else {
             val tr = translatorFor(src, tgt)
+            if (!modelsDownloaded(src, tgt)) {
+                showMessage("Скачиваю языковые модели (около 30 МБ каждая), подождите…")
+            }
             try {
                 Tasks.await(tr.downloadModelIfNeeded(DownloadConditions.Builder().build()))
+            } catch (e: InterruptedException) {
+                throw e
             } catch (e: Exception) {
                 showMessage("Не скачаны языковые модели. Откройте приложение и нажмите кнопку 2 (нужен интернет).")
                 return
@@ -520,6 +714,8 @@ class TranslatorService : Service() {
                 if (original.isEmpty()) continue
                 val translated = try {
                     Tasks.await(tr.translate(original))
+                } catch (e: InterruptedException) {
+                    throw e
                 } catch (e: Exception) {
                     original
                 }
@@ -527,6 +723,20 @@ class TranslatorService : Service() {
             }
         }
         main.post { resultView?.showItems(items, bitmapW, bitmapH) }
+    }
+
+    private fun closeMlKit() {
+        recognizers.values.forEach { recognizer ->
+            try {
+                recognizer.close()
+            } catch (e: Exception) {
+                // уже закрыт
+            }
+        }
+        recognizers.clear()
+        translator?.close()
+        translator = null
+        translatorKey = ""
     }
 
     // ---------------------------------------------------------------- жизненный цикл
@@ -538,39 +748,15 @@ class TranslatorService : Service() {
     }
 
     override fun onDestroy() {
-        if (wmReady) {
-            try {
-                resultView?.let { wm.removeView(it) }
-            } catch (e: Exception) {
-                // уже убрано
-            }
-            try {
-                barView?.let { wm.removeView(it) }
-            } catch (e: Exception) {
-                // уже убрано
-            }
+        removeOverlays()
+        stopCapture()
+        // ML Kit закрываем в том же потоке, где им пользуемся, — после текущей задачи
+        try {
+            worker.execute { closeMlKit() }
+        } catch (e: RejectedExecutionException) {
+            // уже остановлен
         }
-        resultView = null
-        barView = null
-
-        synchronized(frameLock) {
-            latestImage?.close()
-            latestImage = null
-        }
-        virtualDisplay?.release()
-        virtualDisplay = null
-        imageReader?.close()
-        imageReader = null
-        projection?.stop()
-        projection = null
-        captureThread?.quitSafely()
-        captureThread = null
-
-        recognizers.values.forEach { it.close() }
-        recognizers.clear()
-        translator?.close()
-        translator = null
-        worker.shutdownNow()
+        worker.shutdown()
         super.onDestroy()
     }
 }

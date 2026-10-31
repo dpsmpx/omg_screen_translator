@@ -2,10 +2,16 @@ name: Build APK
 
 on:
   push:
+    branches: ["**"]
+  pull_request:
   workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
@@ -20,31 +26,37 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-
-      - name: Install Gradle 8.9
-        run: |
-          wget -q https://services.gradle.org/distributions/gradle-8.9-bin.zip -O "$RUNNER_TEMP/gradle.zip"
-          unzip -q "$RUNNER_TEMP/gradle.zip" -d "$HOME"
-          echo "$HOME/gradle-8.9/bin" >> "$GITHUB_PATH"
+          cache: gradle
 
       - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses > /dev/null || true
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
 
       - name: Build debug APK
-        run: gradle assembleDebug --no-daemon --stacktrace
+        run: |
+          chmod +x gradlew
+          ./gradlew testDebugUnitTest assembleDebug --no-daemon --stacktrace
+
+      - name: Rename APK
+        id: apk
+        run: |
+          name="GameScreenTranslator-1.0.${{ github.run_number }}.apk"
+          cp app/build/outputs/apk/debug/app-debug.apk "$name"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
 
       - name: Upload APK as artifact
         uses: actions/upload-artifact@v7
         with:
           name: GameScreenTranslator-apk
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: ${{ steps.apk.outputs.name }}
           if-no-files-found: error
 
       - name: Publish APK to Releases
+        if: github.event_name != 'pull_request'
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "build-${{ github.run_number }}" app/build/outputs/apk/debug/app-debug.apk \
+          gh release create "build-${{ github.run_number }}" "${{ steps.apk.outputs.name }}" \
+            --target "${{ github.sha }}" \
             --title "Build ${{ github.run_number }}" \
-            --notes "Debug APK, built automatically"
+            --notes "APK собран автоматически из ветки \`${{ github.ref_name }}\` (коммит ${{ github.sha }}). Скачайте файл .apk ниже и установите на телефон."

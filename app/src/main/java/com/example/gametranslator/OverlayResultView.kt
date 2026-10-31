@@ -12,7 +12,12 @@ import android.text.TextPaint
 import android.view.View
 import android.view.WindowManager
 
-/** Прозрачный слой поверх экрана: рисует перевод там, где был исходный текст. */
+/**
+ * Прозрачный слой поверх экрана: рисует перевод там, где был исходный текст.
+ *
+ * Когда показывать нечего, слой скрыт (GONE). Это важно: на Android 12+ видимое
+ * окно другого приложения поверх игры может «съедать» касания, а скрытое — нет.
+ */
 class OverlayResultView(context: Context) : View(context) {
 
     /** Один переведённый кусок: где он был на снимке и сам текст перевода. */
@@ -24,18 +29,28 @@ class OverlayResultView(context: Context) : View(context) {
     private var message: String? = null
 
     private val density = resources.displayMetrics.density
+    private val windowManager: WindowManager = context.getSystemService(WindowManager::class.java)
 
     private val backgroundPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        color = Color.argb(235, 18, 18, 18)
+        color = Color.rgb(18, 18, 18)
     }
 
     private val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
         color = Color.WHITE
     }
 
+    // Переиспользуемые объекты, чтобы не создавать их на каждой перерисовке
+    private val boxRect = RectF()
+    private val location = IntArray(2)
+
     private val hideMessage = Runnable {
         message = null
+        updateVisibility()
         invalidate()
+    }
+
+    init {
+        visibility = GONE
     }
 
     fun showItems(list: List<Item>, bitmapWidth: Int, bitmapHeight: Int) {
@@ -44,6 +59,7 @@ class OverlayResultView(context: Context) : View(context) {
         items = list
         sourceW = bitmapWidth.coerceAtLeast(1)
         sourceH = bitmapHeight.coerceAtLeast(1)
+        updateVisibility()
         invalidate()
     }
 
@@ -52,6 +68,7 @@ class OverlayResultView(context: Context) : View(context) {
         message = text
         removeCallbacks(hideMessage)
         postDelayed(hideMessage, 3500)
+        updateVisibility()
         invalidate()
     }
 
@@ -59,14 +76,12 @@ class OverlayResultView(context: Context) : View(context) {
         removeCallbacks(hideMessage)
         items = emptyList()
         message = null
+        updateVisibility()
         invalidate()
     }
 
-    /** Реальный размер экрана в пикселях (как у снимка экрана). */
-    private fun screenSize(): Pair<Int, Int> {
-        val manager = context.getSystemService(WindowManager::class.java)
-        val bounds = manager.maximumWindowMetrics.bounds
-        return Pair(bounds.width(), bounds.height())
+    private fun updateVisibility() {
+        visibility = if (items.isEmpty() && message == null) GONE else VISIBLE
     }
 
     private fun build(text: String, widthPx: Int, sizePx: Float, align: Layout.Alignment): StaticLayout {
@@ -92,11 +107,11 @@ class OverlayResultView(context: Context) : View(context) {
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
-        val screen = screenSize()
-        val location = IntArray(2)
+        // Реальный размер экрана в пикселях (такой же, как у снимка экрана)
+        val screen = windowManager.maximumWindowMetrics.bounds
         getLocationOnScreen(location)
-        val scaleX = screen.first.toFloat() / sourceW
-        val scaleY = screen.second.toFloat() / sourceH
+        val scaleX = screen.width().toFloat() / sourceW
+        val scaleY = screen.height().toFloat() / sourceH
 
         val pad = 5f * density
         val margin = 4f * density
@@ -117,12 +132,8 @@ class OverlayResultView(context: Context) : View(context) {
             val left = srcLeft.coerceIn(margin, maxOf(margin, width - boxWidth - margin))
             val top = srcTop.coerceIn(0f, maxOf(0f, height - boxHeight))
 
-            canvas.drawRoundRect(
-                RectF(left, top, left + boxWidth, top + boxHeight),
-                radius,
-                radius,
-                backgroundPaint
-            )
+            boxRect.set(left, top, left + boxWidth, top + boxHeight)
+            canvas.drawRoundRect(boxRect, radius, radius, backgroundPaint)
             canvas.save()
             canvas.translate(left + pad, top + pad)
             layout.draw(canvas)
@@ -136,12 +147,8 @@ class OverlayResultView(context: Context) : View(context) {
             val bannerHeight = layout.height + 2 * pad
             val left = (width - bannerWidth) / 2f
             val top = 48f * density
-            canvas.drawRoundRect(
-                RectF(left, top, left + bannerWidth, top + bannerHeight),
-                radius,
-                radius,
-                backgroundPaint
-            )
+            boxRect.set(left, top, left + bannerWidth, top + bannerHeight)
+            canvas.drawRoundRect(boxRect, radius, radius, backgroundPaint)
             canvas.save()
             canvas.translate(left + pad, top + pad)
             layout.draw(canvas)

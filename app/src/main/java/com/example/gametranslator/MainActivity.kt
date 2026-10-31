@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Activity
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.projection.MediaProjectionConfig
 import android.media.projection.MediaProjectionManager
 import android.net.Uri
 import android.os.Build
@@ -28,6 +29,8 @@ class MainActivity : Activity() {
 
     private lateinit var statusView: TextView
     private lateinit var rootBox: CheckBox
+    private lateinit var sourceSpinner: Spinner
+    private lateinit var targetSpinner: Spinner
 
     private val requestCapture = 1001
     private val requestNotifications = 1002
@@ -35,7 +38,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(buildUi())
-        if (Build.VERSION.SDK_INT >= 33 &&
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
             checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
         ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), requestNotifications)
@@ -44,6 +47,9 @@ class MainActivity : Activity() {
 
     override fun onResume() {
         super.onResume()
+        // язык игры могли поменять кнопкой на плавающей панели
+        sourceSpinner.setSelection(Langs.sources.indexOfFirst { it.code == Prefs.source(this) }.coerceAtLeast(0))
+        targetSpinner.setSelection(Langs.targets.indexOfFirst { it.code == Prefs.target(this) }.coerceAtLeast(0))
         refreshStatus()
     }
 
@@ -74,7 +80,7 @@ class MainActivity : Activity() {
             column.addView(button)
         }
 
-        fun addSpinner(titles: List<String>, selected: Int, onPick: (Int) -> Unit) {
+        fun addSpinner(titles: List<String>, selected: Int, onPick: (Int) -> Unit): Spinner {
             val spinner = Spinner(this)
             spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, titles)
             spinner.setSelection(selected)
@@ -86,6 +92,7 @@ class MainActivity : Activity() {
                 override fun onNothingSelected(parent: AdapterView<*>?) {}
             }
             column.addView(spinner)
+            return spinner
         }
 
         addText("Экранный переводчик для игр", 22f)
@@ -96,13 +103,13 @@ class MainActivity : Activity() {
         )
 
         addText("Язык игры (с какого переводим):", 16f)
-        addSpinner(
+        sourceSpinner = addSpinner(
             Langs.sources.map { it.title },
             Langs.sources.indexOfFirst { it.code == Prefs.source(this) }.coerceAtLeast(0)
         ) { position -> Prefs.setSource(this, Langs.sources[position].code) }
 
         addText("Переводить на:", 16f)
-        addSpinner(
+        targetSpinner = addSpinner(
             Langs.targets.map { it.title },
             Langs.targets.indexOfFirst { it.code == Prefs.target(this) }.coerceAtLeast(0)
         ) { position -> Prefs.setTarget(this, Langs.targets[position].code) }
@@ -219,8 +226,15 @@ class MainActivity : Activity() {
         if (Prefs.root(this)) {
             launchService(true, 0, null)
         } else {
-            val manager = getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
-            startActivityForResult(manager.createScreenCaptureIntent(), requestCapture)
+            val manager = getSystemService(MediaProjectionManager::class.java)
+            val captureIntent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                // Android 14+: нужен снимок ВСЕГО экрана. При записи «одного приложения»
+                // координаты текста не совпадут с экраном и перевод окажется не на месте.
+                manager.createScreenCaptureIntent(MediaProjectionConfig.createConfigForDefaultDisplay())
+            } else {
+                manager.createScreenCaptureIntent()
+            }
+            startActivityForResult(captureIntent, requestCapture)
         }
     }
 
@@ -230,7 +244,7 @@ class MainActivity : Activity() {
     }
 
     private fun launchService(useRoot: Boolean, resultCode: Int, data: Intent?) {
-        stopService(Intent(this, TranslatorService::class.java))
+        // Если служба уже работает, она сама уберёт старую панель и старую запись экрана
         val intent = Intent(this, TranslatorService::class.java)
         intent.putExtra(TranslatorService.EXTRA_ROOT, useRoot)
         intent.putExtra(TranslatorService.EXTRA_RESULT_CODE, resultCode)
